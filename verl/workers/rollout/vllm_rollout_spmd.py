@@ -180,6 +180,7 @@ class vLLMRollout(BaseRollout):
             setattr(self.sampling_params, key, value)
     
     def _apply_chat_template_from_raw_prompt(self, raw_prompt: list[dict[str, Any]]) -> str:
+        # agentic process
         if self.processor is not None:
             return self.processor.apply_chat_template(raw_prompt, add_generation_prompt=True, tokenize=False)
         return self.tokenizer.apply_chat_template(raw_prompt, add_generation_prompt=True, tokenize=False)
@@ -342,6 +343,7 @@ class vLLMRollout(BaseRollout):
     
     @torch.no_grad()
     def _generate_sequences_agentic(self, prompts: DataProto) -> DataProto:
+        # message-first agentic generation. Only switches the generation input source.
         input_ids: torch.Tensor = prompts.batch["input_ids"]
         attention_mask: torch.Tensor = prompts.batch["attention_mask"]
         position_ids: torch.Tensor = prompts.batch["position_ids"]
@@ -383,7 +385,7 @@ class vLLMRollout(BaseRollout):
                 batch_raw_prompt = _repeat_interleave(batch_raw_prompt, self.sampling_params.n)
                 if batch_multi_modal_data is not None:
                     batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
-
+        
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
         response_length = response_ids.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
