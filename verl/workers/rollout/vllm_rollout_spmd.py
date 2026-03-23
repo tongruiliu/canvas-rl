@@ -450,6 +450,21 @@ class vLLMRollout(BaseRollout):
             return self.config.agent.default_agent_loop != "single_turn_agent" and self.config.agent.enable
         return False
     
+    def _pad_response_ids_and_masks(
+        self,
+        response_id_list: list[list[int]],
+        response_mask_list: list[list[int]],
+        device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad token ids and response masks to the configured response length."""
+        padded_response_ids = VF.pad_2d_list_to_length(
+            response_id_list, self.pad_token_id, max_length=self.config.response_length
+        ).to(device)
+        padded_response_masks = VF.pad_2d_list_to_length(
+            response_mask_list, 0, max_length=self.config.response_length
+        ).to(device)
+        return padded_response_ids, padded_response_masks
+    
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         if self._use_agentic_rollout(prompts):
@@ -557,7 +572,7 @@ class vLLMRollout(BaseRollout):
     
     @torch.no_grad()
     def _generate_sequences_agentic(self, prompts: DataProto) -> DataProto:
-        # message-first agentic generation. Only switches the generation input source.
+        """Run the message-first agentic rollout across the whole batch."""
         input_ids: torch.Tensor = prompts.batch["input_ids"]
         attention_mask: torch.Tensor = prompts.batch["attention_mask"]
         position_ids: torch.Tensor = prompts.batch["position_ids"]
@@ -571,35 +586,38 @@ class vLLMRollout(BaseRollout):
 
         if batch_size != len(batch_raw_prompt):
             raise RuntimeError("Agentic rollout batch is inconsistent with raw_prompt size.")
-
-        vllm_inputs = self._build_agentic_vllm_inputs(
-            batch_raw_prompt=batch_raw_prompt,
-            batch_multi_modal_data=batch_multi_modal_data,
-            meta_info=prompts.meta_info,
-        )
-        lora_requests = self._build_lora_requests(batch_size)
-
-        with self.update_sampling_params(**prompts.meta_info):
-            completions: list[RequestOutput] = self.inference_engine.generate(
-                prompts=vllm_inputs,
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=self.use_tqdm,
-            )
-            response_ids = [output.token_ids for completion in completions for output in completion.outputs]
-            response_ids = VF.pad_2d_list_to_length(
-                response_ids, self.pad_token_id, max_length=self.config.response_length
-            ).to(input_ids.device)
-
-            if self.sampling_params.n > 1:
-                batch_size = batch_size * self.sampling_params.n
-                input_ids = _repeat_interleave(input_ids, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_raw_prompt = _repeat_interleave(batch_raw_prompt, self.sampling_params.n)
-                if batch_multi_modal_data is not None:
-                    batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
         
+        rollout_n = prompts.meta_info.get("n", self.config.n)
+        all_response_ids = []
+        all_response_masks = []
+        all_multi_modal_data = []
+        all_raw_prompts = []
+
+        for sample_idx in range(batch_size):
+            raw_prompt = list(batch_raw_prompt[sample_idx])
+            sample_mm = None if batch_multi_modal_data is None else batch_multi_modal_data[sample_idx]
+
+            for _ in range(rollout_n):
+                sample_response_ids, sample_response_mask, sample_final_mm = self._run_agentic_sample_once(
+                    raw_prompt=raw_prompt,
+                    multi_modal_data=sample_mm,
+                    meta_info=prompts.meta_info,
+                )
+                all_response_ids.append(sample_response_ids)
+                all_response_masks.append(sample_response_mask)
+                all_multi_modal_data.append(sample_final_mm)
+                all_raw_prompts.append(raw_prompt)
+        
+        response_ids, response_mask = self._pad_response_ids_and_masks(
+            all_response_ids, all_response_masks, input_ids.device
+        )
+
+        if rollout_n > 1:
+            input_ids = _repeat_interleave(input_ids, rollout_n)
+            attention_mask = _repeat_interleave(attention_mask, rollout_n)
+            position_ids = _repeat_interleave(position_ids, rollout_n)
+            batch_size = batch_size * rollout_n
+
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
         response_length = response_ids.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
@@ -609,10 +627,7 @@ class vLLMRollout(BaseRollout):
 
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_mask = VF.get_response_mask(
-            response_ids=response_ids, eos_token_id=eos_token_id, dtype=attention_mask.dtype
-        )
-        attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
+        attention_mask = torch.cat((attention_mask, response_mask.to(attention_mask.dtype)), dim=-1)
 
         batch = TensorDict(
             {
@@ -620,14 +635,16 @@ class vLLMRollout(BaseRollout):
                 "responses": response_ids,
                 "input_ids": sequence_ids,
                 "attention_mask": attention_mask,
-                "response_mask": response_mask,
+                "response_mask": response_mask.to(attention_mask.dtype),
                 "position_ids": position_ids,
             },
             batch_size=batch_size,
         )
-
-        output_non_tensor_batch = {"raw_prompt": batch_raw_prompt}
-        if batch_multi_modal_data is not None:
-            output_non_tensor_batch["multi_modal_data"] = batch_multi_modal_data
+        
+        output_non_tensor_batch = {
+            "raw_prompt": np.array(all_raw_prompts, dtype=object),
+        }
+        if any(mm is not None for mm in all_multi_modal_data):
+            output_non_tensor_batch["multi_modal_data"] = np.array(all_multi_modal_data, dtype=object)
 
         return DataProto(batch=batch, non_tensor_batch=output_non_tensor_batch, meta_info=prompts.meta_info)
