@@ -1,3 +1,5 @@
+"""Dataclass-based tool schemas used by the generic agentic rollout path."""
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 

@@ -1,3 +1,5 @@
+"""Utility for loading generic tool implementations from a YAML config."""
+
 import importlib
 from dataclasses import fields, is_dataclass
 from typing import Any

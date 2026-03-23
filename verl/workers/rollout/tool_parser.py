@@ -40,7 +40,6 @@ class ToolParser:
 
         return decorator
 
-
 @ToolParser.register("hermes")
 class HermesToolParser(ToolParser):
     def __init__(self, tokenizer) -> None:
@@ -68,9 +67,9 @@ class HermesToolParser(ToolParser):
             except Exception:
                 continue
 
+        # text without tool_calls.
         content = self.tool_call_regex.sub("", text)
         return content, function_calls
-
 
 @ToolParser.register("gpt-oss")
 class GptOssToolParser(ToolParser):

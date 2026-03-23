@@ -32,6 +32,9 @@ from ...utils.vllm_utils import VLLMHijack
 from .base import BaseRollout
 from .config import RolloutConfig
 
+from ...tools import initialize_tools_from_config
+from .tool_parser import ToolParser
+
 
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
     # repeat the elements, supports both tensor and numpy array
@@ -117,6 +120,17 @@ class vLLMRollout(BaseRollout):
 
         lora_kwargs = kwargs.pop("lora_kwargs", {})
         self.lora_kwargs = lora_kwargs
+        
+        self.tools = {}
+        self.tool_schemas = []
+        self.tool_parser = None
+        if self.config.multi_turn.enable:
+            tool_list = []
+            if self.config.multi_turn.tool_config_path:
+                tool_list = initialize_tools_from_config(self.config.multi_turn.tool_config_path)
+            self.tools = {tool.name: tool for tool in tool_list}
+            self.tool_schemas = [tool.tool_schema for tool in tool_list]
+            self.tool_parser = ToolParser.get_tool_parser(self.config.multi_turn.format, tokenizer)
 
         engine_kwargs = {}
         if processor is not None:  # only VLMs have processor
