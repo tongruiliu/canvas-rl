@@ -501,6 +501,9 @@ class FSDPWorker(Worker):
             offload_fsdp_optimizer(self.optimizer)
 
     def _process_multi_modal_inputs(self, data: DataProto):
+        if "multi_modal_inputs" in data.non_tensor_batch:
+            return
+
         if "multi_modal_data" not in data.non_tensor_batch:
             return
 

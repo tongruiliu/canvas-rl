@@ -465,6 +465,29 @@ class vLLMRollout(BaseRollout):
         ).to(device)
         return padded_response_ids, padded_response_masks
     
+    def _build_multi_modal_inputs_cache(self, batch_multi_modal_data: list[Optional[dict[str, Any]]]) -> np.ndarray:
+        """Convert final multimodal sample state into cached processor inputs for actor/ref scoring."""
+        cached = []
+        for multi_modal_data in batch_multi_modal_data:
+            if multi_modal_data is None:
+                cached.append({})
+                continue
+
+            images, videos = [], []
+            if "images" in multi_modal_data:
+                images.extend(multi_modal_data["images"])
+            if "videos" in multi_modal_data:
+                videos.extend(multi_modal_data["videos"])
+
+            if len(images) != 0:
+                cached.append(dict(self.processor.image_processor(images=images, return_tensors="pt")))
+            elif len(videos) != 0:
+                cached.append(dict(self.processor.image_processor(images=None, videos=videos, return_tensors="pt")))
+            else:
+                cached.append({})
+
+        return np.array(cached, dtype=object)
+    
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         if self._use_agentic_rollout(prompts):
@@ -646,5 +669,8 @@ class vLLMRollout(BaseRollout):
         }
         if any(mm is not None for mm in all_multi_modal_data):
             output_non_tensor_batch["multi_modal_data"] = np.array(all_multi_modal_data, dtype=object)
+        
+        if self.processor is not None and any(mm is not None for mm in all_multi_modal_data):
+            output_non_tensor_batch["multi_modal_inputs"] = self._build_multi_modal_inputs_cache(all_multi_modal_data)
 
         return DataProto(batch=batch, non_tensor_batch=output_non_tensor_batch, meta_info=prompts.meta_info)
