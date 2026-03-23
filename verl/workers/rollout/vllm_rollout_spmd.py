@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import copy
+import json
+
 import os
 from contextlib import contextmanager
 from typing import Any, Optional, Union
@@ -32,7 +36,7 @@ from ...utils.vllm_utils import VLLMHijack
 from .base import BaseRollout
 from .config import RolloutConfig
 
-from ...tools import initialize_tools_from_config
+from ...tools import ToolResponse, initialize_tools_from_config
 from .tool_parser import ToolParser
 
 
@@ -240,6 +244,202 @@ class vLLMRollout(BaseRollout):
         return [
             LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
         ] * batch_size
+    
+    def _run_async_tool(self, coroutine):
+        """
+        Run async tool hooks from the synchronous rollout worker.
+        coroutine is function that can pause and recover, often definited by async def.
+        coroutine can not run directly, should use event loop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            new_loop = asyncio.new_event_loop()
+            try:
+                return new_loop.run_until_complete(coroutine)
+            finally:
+                new_loop.close()
+        return asyncio.run(coroutine)
+    
+    def _truncate_tool_text(self, text: Optional[str]) -> Optional[str]:
+        """Truncate long tool outputs using the current multi_turn config."""
+        if text is None:
+            return None
+
+        max_len = self.config.multi_turn.max_tool_response_length
+        if len(text) <= max_len:
+            return text
+
+        side = self.config.multi_turn.tool_response_truncate_side
+        if side == "left":
+            return text[:max_len] + "...(truncated)"
+        if side == "right":
+            return "(truncated)..." + text[-max_len:]
+
+        half = max_len // 2
+        return text[:half] + "...(truncated)..." + text[-half:]
+    
+    def _call_tool(
+        self,
+        function_call,
+    ) -> tuple[ToolResponse, float, dict]:
+        """Execute one parsed tool call and return a normalized ToolResponse."""
+        if function_call.name not in self.tools:
+            return ToolResponse(text=f"Unknown tool: {function_call.name}"), 0.0, {}
+
+        tool = self.tools[function_call.name]
+        try:
+            tool_args = json.loads(function_call.arguments)
+        except Exception as exc:
+            return ToolResponse(text=f"Invalid tool arguments: {exc}"), 0.0, {}
+
+        instance_id, _ = self._run_async_tool(tool.create())
+        try:
+            tool_response, _, _ = self._run_async_tool(
+                tool.execute(instance_id=instance_id, parameters=tool_args)
+            )
+        except Exception as exc:
+            return ToolResponse(text=f"Error when executing tool: {exc}"), 0.0, {}
+        finally:
+            self._run_async_tool(tool.release(instance_id))
+
+        tool_response.text = self._truncate_tool_text(tool_response.text)
+        return tool_response, 0.0, {}
+    
+    def _tool_response_to_message(self, tool_response: ToolResponse) -> dict[str, Any]:
+        """Convert one ToolResponse into a tool-role chat message."""
+        if tool_response.image or tool_response.video:
+            content = []
+            if tool_response.image:
+                content.append({"type": "image"})
+            if tool_response.video:
+                content.append({"type": "video"})
+            if tool_response.text:
+                content.append({"type": "text", "text": tool_response.text})
+            return {"role": "tool", "content": content}
+
+        return {"role": "tool", "content": tool_response.text or ""}
+    
+    def _merge_multi_modal_data(
+        self,
+        current_multi_modal_data: Optional[dict[str, Any]],
+        tool_response: ToolResponse,
+    ) -> Optional[dict[str, Any]]:
+        """Merge tool-returned images/videos into the current sample state."""
+        if not tool_response.image and not tool_response.video:
+            return current_multi_modal_data
+
+        if current_multi_modal_data is None:
+            merged = {}
+        else:
+            merged = copy.deepcopy(current_multi_modal_data)
+
+        if tool_response.image:
+            # if "images" is not existed in merged, create; else, do nothing.
+            merged.setdefault("images", [])
+            merged["images"].extend(tool_response.image)
+        if tool_response.video:
+            merged.setdefault("videos", [])
+            merged["videos"].extend(tool_response.video)
+
+        return merged
+
+    def _run_agentic_sample_once(
+        self,
+        raw_prompt: list[dict[str, Any]],
+        multi_modal_data: Optional[dict[str, Any]],
+        meta_info: dict[str, Any],
+    ) -> tuple[list[int], list[int], Optional[dict[str, Any]]]:
+        """Run one full agentic trajectory for a single sample."""
+        messages = list(raw_prompt)
+        current_multi_modal_data = copy.deepcopy(multi_modal_data) if multi_modal_data is not None else None
+        response_token_chunks: list[int] = []
+        # 1:model generate, 0:tool return.
+        response_mask_chunks: list[int] = []
+        assistant_turns = 0
+        user_turns = 0
+
+        while len(response_mask_chunks) < self.config.response_length:
+            assistant_turns += 1
+            if (
+                self.config.multi_turn.max_assistant_turns is not None
+                and assistant_turns > self.config.multi_turn.max_assistant_turns
+            ):
+                break
+
+            prompt_text = self._apply_chat_template_from_raw_prompt(messages)
+            prompt_token_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+            if len(prompt_token_ids) > self.config.prompt_length:
+                prompt_token_ids = prompt_token_ids[: self.config.prompt_length]
+            
+            vllm_input = {"prompt_token_ids": prompt_token_ids}
+            if current_multi_modal_data is not None:
+                vllm_input["multi_modal_data"] = _process_multi_modal_data(
+                    current_multi_modal_data,
+                    meta_info["min_pixels"],
+                    meta_info["max_pixels"],
+                    meta_info["video_fps"],
+                    return_video_metadata=self.return_video_metadata,
+                )
+
+            with self.update_sampling_params(**meta_info):
+                old_n = self.sampling_params.n
+                self.sampling_params.n = 1
+                try:
+                    completion = self.inference_engine.generate(
+                        prompts=[vllm_input],
+                        sampling_params=self.sampling_params,
+                        lora_request=self._build_lora_requests(1),
+                        use_tqdm=False,
+                    )[0]
+                finally:
+                    self.sampling_params.n = old_n
+            
+            generated_ids = completion.outputs[0].token_ids
+            response_token_chunks.extend(generated_ids)
+            response_mask_chunks.extend([1] * len(generated_ids))
+
+            if len(response_mask_chunks) >= self.config.response_length:
+                break
+
+            if self.tool_parser is None:
+                break
+
+            assistant_text, function_calls = self.tool_parser.extract_tool_calls(generated_ids)
+            messages.append({"role": "assistant", "content": assistant_text})
+
+            if not function_calls:
+                break
+
+            tool_messages = []
+            for function_call in function_calls[: self.config.multi_turn.max_parallel_calls]:
+                tool_response, _, _ = self._call_tool(function_call)
+                tool_message = self._tool_response_to_message(tool_response)
+                tool_messages.append(tool_message)
+                current_multi_modal_data = self._merge_multi_modal_data(current_multi_modal_data, tool_response)
+
+            if not tool_messages:
+                break
+
+            user_turns += 1
+            if self.config.multi_turn.max_user_turns is not None and user_turns > self.config.multi_turn.max_user_turns:
+                break
+
+            # Re-encode only the tool messages as observation tokens.
+            tool_prompt_text = self._apply_chat_template_from_raw_prompt(tool_messages)
+            tool_token_ids = self.tokenizer.encode(tool_prompt_text, add_special_tokens=False)
+            response_token_chunks.extend(tool_token_ids)
+            response_mask_chunks.extend([0] * len(tool_token_ids))
+            messages.extend(tool_messages)
+
+        return (
+            response_token_chunks[: self.config.response_length],
+            response_mask_chunks[: self.config.response_length],
+            current_multi_modal_data,
+        )
     
     def _use_agentic_rollout(self, prompts: DataProto) -> bool:
         if self.config.agent.enable:

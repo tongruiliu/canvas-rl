@@ -1,3 +1,5 @@
+"""Base tool abstraction for the generic agentic rollout path."""
+
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -8,14 +10,15 @@ class BaseTool:
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
         """Store tool config and expose a normalized schema / name."""
         self.config = config
-        self.tool_schema = tool_schema or self.get_openai_tool_schema()
-        if self.tool_schema is None:
+        resolved_schema = tool_schema if tool_schema is not None else self.get_openai_tool_schema()
+        if resolved_schema is None:
             raise ValueError("Tool schema is not set.")
+        self.tool_schema = resolved_schema
         self.name = self.tool_schema.function.name
 
-    def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
+    def get_openai_tool_schema(self) -> Optional[OpenAIFunctionToolSchema]:
         """Return the OpenAI-style schema used for prompting the model."""
-        return self.tool_schema
+        return None
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
         """Create one tool session for a trajectory or sample."""
