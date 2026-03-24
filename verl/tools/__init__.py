@@ -8,3 +8,4 @@ from .schemas import (
     ToolResponse,
 )
 from .tool_registry import initialize_tools_from_config
+from .canvas_tools import canvas_tools
