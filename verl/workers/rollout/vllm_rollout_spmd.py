@@ -352,8 +352,8 @@ class vLLMRollout(BaseRollout):
         raw_prompt: list[dict[str, Any]],
         multi_modal_data: Optional[dict[str, Any]],
         meta_info: dict[str, Any],
-    ) -> tuple[list[int], list[int], Optional[dict[str, Any]]]:
-        """Run one full agentic trajectory for a single sample."""
+    ) -> tuple[list[int], list[int], Optional[dict[str, Any]], dict[str, Any]]:
+        """Run one full agentic trajectory for a single sample and return trajectory metadata."""
         messages = list(raw_prompt)
         current_multi_modal_data = copy.deepcopy(multi_modal_data) if multi_modal_data is not None else None
         response_token_chunks: list[int] = []
@@ -361,6 +361,9 @@ class vLLMRollout(BaseRollout):
         response_mask_chunks: list[int] = []
         assistant_turns = 0
         user_turns = 0
+        tool_call_count = 0
+        tool_failure_count = 0
+        stop_reason = "max_response_length"
 
         while len(response_mask_chunks) < self.config.response_length:
             assistant_turns += 1
@@ -368,6 +371,7 @@ class vLLMRollout(BaseRollout):
                 self.config.multi_turn.max_assistant_turns is not None
                 and assistant_turns > self.config.multi_turn.max_assistant_turns
             ):
+                stop_reason = "max_assistant_turns"
                 break
 
             prompt_text = self._apply_chat_template_from_raw_prompt(messages)
@@ -403,29 +407,37 @@ class vLLMRollout(BaseRollout):
             response_mask_chunks.extend([1] * len(generated_ids))
 
             if len(response_mask_chunks) >= self.config.response_length:
+                stop_reason = "max_response_length"
                 break
 
             if self.tool_parser is None:
+                stop_reason = "no_tool_parser"
                 break
 
             assistant_text, function_calls = self.tool_parser.extract_tool_calls(generated_ids)
             messages.append({"role": "assistant", "content": assistant_text})
 
             if not function_calls:
+                stop_reason = "finished_no_tool_call"
                 break
 
             tool_messages = []
             for function_call in function_calls[: self.config.multi_turn.max_parallel_calls]:
+                tool_call_count += 1
                 tool_response, _, _ = self._call_tool(function_call)
+                if tool_response.text and tool_response.text.startswith("Error when executing tool:"):
+                    tool_failure_count += 1
                 tool_message = self._tool_response_to_message(tool_response)
                 tool_messages.append(tool_message)
                 current_multi_modal_data = self._merge_multi_modal_data(current_multi_modal_data, tool_response)
 
             if not tool_messages:
+                stop_reason = "empty_tool_messages"
                 break
 
             user_turns += 1
             if self.config.multi_turn.max_user_turns is not None and user_turns > self.config.multi_turn.max_user_turns:
+                stop_reason = "max_user_turns"
                 break
 
             # Re-encode only the tool messages as observation tokens.
@@ -434,11 +446,21 @@ class vLLMRollout(BaseRollout):
             response_token_chunks.extend(tool_token_ids)
             response_mask_chunks.extend([0] * len(tool_token_ids))
             messages.extend(tool_messages)
+        
+        trajectory_info = {
+            "num_turns": assistant_turns + user_turns + 1,
+            "assistant_turns": assistant_turns,
+            "user_turns": user_turns,
+            "tool_calls": tool_call_count,
+            "tool_failures": tool_failure_count,
+            "stop_reason": stop_reason,
+        }
 
         return (
             response_token_chunks[: self.config.response_length],
             response_mask_chunks[: self.config.response_length],
             current_multi_modal_data,
+            trajectory_info,
         )
     
     def _use_agentic_rollout(self, prompts: DataProto) -> bool:
@@ -487,6 +509,19 @@ class vLLMRollout(BaseRollout):
                 cached.append({})
 
         return np.array(cached, dtype=object)
+    
+    def _summarize_agentic_batch(self, traj_infos: list[dict[str, Any]]) -> dict[str, float]:
+        """Summarize one agentic rollout batch into scalar metrics."""
+        if len(traj_infos) == 0:
+            return {}
+
+        return {
+            "agentic/avg_num_turns": float(np.mean([info["num_turns"] for info in traj_infos])),
+            "agentic/avg_assistant_turns": float(np.mean([info["assistant_turns"] for info in traj_infos])),
+            "agentic/avg_user_turns": float(np.mean([info["user_turns"] for info in traj_infos])),
+            "agentic/avg_tool_calls": float(np.mean([info["tool_calls"] for info in traj_infos])),
+            "agentic/avg_tool_failures": float(np.mean([info["tool_failures"] for info in traj_infos])),
+        }
     
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -615,13 +650,14 @@ class vLLMRollout(BaseRollout):
         all_response_masks = []
         all_multi_modal_data = []
         all_raw_prompts = []
+        all_traj_infos = []
 
         for sample_idx in range(batch_size):
             raw_prompt = list(batch_raw_prompt[sample_idx])
             sample_mm = None if batch_multi_modal_data is None else batch_multi_modal_data[sample_idx]
 
             for _ in range(rollout_n):
-                sample_response_ids, sample_response_mask, sample_final_mm = self._run_agentic_sample_once(
+                sample_response_ids, sample_response_mask, sample_final_mm, sample_traj_info = self._run_agentic_sample_once(
                     raw_prompt=raw_prompt,
                     multi_modal_data=sample_mm,
                     meta_info=prompts.meta_info,
@@ -630,6 +666,7 @@ class vLLMRollout(BaseRollout):
                 all_response_masks.append(sample_response_mask)
                 all_multi_modal_data.append(sample_final_mm)
                 all_raw_prompts.append(raw_prompt)
+                all_traj_infos.append(sample_traj_info)
         
         response_ids, response_mask = self._pad_response_ids_and_masks(
             all_response_ids, all_response_masks, input_ids.device
@@ -667,10 +704,33 @@ class vLLMRollout(BaseRollout):
         output_non_tensor_batch = {
             "raw_prompt": np.array(all_raw_prompts, dtype=object),
         }
+
+        output_non_tensor_batch["agentic_num_turns"] = np.array(
+            [info["num_turns"] for info in all_traj_infos], dtype=np.int32
+        )
+        output_non_tensor_batch["agentic_assistant_turns"] = np.array(
+            [info["assistant_turns"] for info in all_traj_infos], dtype=np.int32
+        )
+        output_non_tensor_batch["agentic_user_turns"] = np.array(
+            [info["user_turns"] for info in all_traj_infos], dtype=np.int32
+        )
+        output_non_tensor_batch["agentic_tool_calls"] = np.array(
+            [info["tool_calls"] for info in all_traj_infos], dtype=np.int32
+        )
+        output_non_tensor_batch["agentic_tool_failures"] = np.array(
+            [info["tool_failures"] for info in all_traj_infos], dtype=np.int32
+        )
+        output_non_tensor_batch["agentic_stop_reason"] = np.array(
+            [info["stop_reason"] for info in all_traj_infos], dtype=object
+        )
+
         if any(mm is not None for mm in all_multi_modal_data):
             output_non_tensor_batch["multi_modal_data"] = np.array(all_multi_modal_data, dtype=object)
         
         if self.processor is not None and any(mm is not None for mm in all_multi_modal_data):
             output_non_tensor_batch["multi_modal_inputs"] = self._build_multi_modal_inputs_cache(all_multi_modal_data)
+        
+        meta_info = dict(prompts.meta_info)
+        meta_info["agentic_metrics"] = self._summarize_agentic_batch(all_traj_infos)
 
-        return DataProto(batch=batch, non_tensor_batch=output_non_tensor_batch, meta_info=prompts.meta_info)
+        return DataProto(batch=batch, non_tensor_batch=output_non_tensor_batch, meta_info=meta_info)

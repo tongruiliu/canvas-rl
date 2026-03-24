@@ -392,7 +392,7 @@ class RayPPOTrainer:
     def _validate(self) -> dict[str, Any]:
         reward_tensor_lst = []
         # Lists to collect samples for the table
-        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
+        sample_inputs, sample_outputs, sample_labels, sample_scores, sample_num_turns = [], [], [], [], []
         reward_metrics_lst = defaultdict(list)
         length_metrics_lst = defaultdict(list)
         print("Start validation...")
@@ -417,6 +417,10 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
             test_batch = test_batch.union(test_output_gen_batch)
 
+            if "agentic_metrics" in test_output_gen_batch.meta_info:
+                for key, value in test_output_gen_batch.meta_info["agentic_metrics"].items():
+                    reward_metrics_lst[key].append(value)
+
             # evaluate using reward_function
             reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
 
@@ -426,10 +430,17 @@ class RayPPOTrainer:
             output_ids = test_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             scores = reward_tensor.sum(-1).cpu().tolist()
+
+            if "agentic_num_turns" in test_batch.non_tensor_batch:
+                sample_turns = test_batch.non_tensor_batch["agentic_num_turns"].tolist()
+            else:
+                sample_turns = [1] * len(output_texts)
+
             sample_inputs.extend(input_texts)
             sample_outputs.extend(output_texts)
             sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
             sample_scores.extend(scores)
+            sample_num_turns.extend(sample_turns)
 
             reward_tensor_lst.append(reward_tensor)
             for key, value in reward_metrics.items():
@@ -515,11 +526,20 @@ class RayPPOTrainer:
             # repeat to align with repeated responses in rollout
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
             new_batch = new_batch.union(gen_batch_output)
+        
+            if "agentic_metrics" in gen_batch_output.meta_info:
+                for key, value in gen_batch_output.meta_info["agentic_metrics"].items():
+                    metrics[key] = value
 
             # filter group
             if self.config.algorithm.online_filtering:
                 reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(new_batch))
                 new_batch.batch["token_level_scores"] = reward_tensor
+                if "agentic_tool_failures" in new_batch.non_tensor_batch:
+                    tool_failures = new_batch.non_tensor_batch["agentic_tool_failures"]
+                    kept_sample_idxs = [idx for idx, failures in enumerate(tool_failures) if failures == 0]
+                    if len(kept_sample_idxs) > 0:
+                        new_batch = new_batch[kept_sample_idxs]
                 for k, v in reward_metrics.items():
                     all_metrics[k].extend(v)
 
