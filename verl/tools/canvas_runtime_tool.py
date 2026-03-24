@@ -1,14 +1,17 @@
-"""Canvas runtime helpers for RL-side agentic interaction."""
+"""Canvas runtime helpers for RL-side agentic interaction.
+
+This file is an EasyR1-native rewrite of the Canvas pipeline runtime.
+It intentionally does not import from the SFT data-generation pipeline.
+"""
 
 import os
+import tempfile
 import warnings
 from typing import Any, Optional
+from uuid import uuid4
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from playwright.sync_api import sync_playwright
-
-import tempfile
-from uuid import uuid4
 
 from .base_tool import BaseTool
 from .schemas import ToolResponse
@@ -18,7 +21,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 
 class CanvasNotebookState:
-    """HTML notebook state for RL-side Canvas interaction."""
+    """HTML notebook state rewritten for RL-side Canvas interaction."""
 
     def __init__(self, initial_svg: Optional[str] = None):
         try:
@@ -357,23 +360,26 @@ class CanvasNotebookState:
 
 
 class CanvasRuntimeTool(BaseTool):
+    """Canvas task runtime tool used by EasyR1 agentic rollout."""
+
+    _shared_states: dict[str, CanvasNotebookState] = {}
 
     def __init__(self, config: dict, tool_schema=None):
         super().__init__(config=config, tool_schema=tool_schema)
-        self._states: dict[str, CanvasNotebookState] = {}
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
-        """Create one isolated notebook state for the current rollout instance."""
+        """Create or reuse one isolated notebook state for the current rollout instance."""
         instance_id = instance_id or str(uuid4())
-        self._states[instance_id] = CanvasNotebookState()
+        if instance_id not in self._shared_states:
+            self._shared_states[instance_id] = CanvasNotebookState(initial_svg=kwargs.get("initial_svg"))
         return instance_id, ToolResponse(text="canvas notebook created")
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         """Dispatch one Canvas operation and render the latest notebook image."""
-        if instance_id not in self._states:
+        if instance_id not in self._shared_states:
             raise ValueError(f"Unknown canvas instance: {instance_id}")
 
-        state = self._states[instance_id]
+        state = self._shared_states[instance_id]
         operation = self.name
 
         if operation == "insert_element":
@@ -400,4 +406,4 @@ class CanvasRuntimeTool(BaseTool):
 
     async def release(self, instance_id: str, **kwargs) -> None:
         """Release the notebook state after the rollout trajectory finishes."""
-        self._states.pop(instance_id, None)
+        self._shared_states.pop(instance_id, None)

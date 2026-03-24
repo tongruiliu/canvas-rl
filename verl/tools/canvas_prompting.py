@@ -1,3 +1,5 @@
+"""Canvas-task prompting helpers for RL-side tool use."""
+
 import json
 from typing import Any
 
@@ -93,6 +95,6 @@ For each function call, return a json object with function name and arguments wi
 
 
 def build_canvas_system_prompt(tool_schemas: list[dict[str, Any]]) -> str:
-    
+    """Build the Canvas system prompt using the RL-side registered tool schemas."""
     tools_text = json.dumps(tool_schemas, ensure_ascii=False, indent=2)
     return SYSTEM_PROMPT_TEMPLATE.replace("{provided_tools}", tools_text)

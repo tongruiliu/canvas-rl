@@ -8,9 +8,10 @@ from typing import Any, Optional
 class OpenAIFunctionPropertySchema:
     """Schema for one tool argument property."""
 
-    type: str
+    type: str | list[str]
     description: Optional[str] = None
     enum: Optional[list[str]] = None
+    additionalProperties: Optional[bool] = None
 
 @dataclass
 class OpenAIFunctionParametersSchema:

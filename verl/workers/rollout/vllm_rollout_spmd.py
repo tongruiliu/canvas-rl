@@ -41,6 +41,9 @@ from .tool_parser import ToolParser
 from ...tools.canvas_prompting import build_canvas_system_prompt
 
 
+CANVAS_TOOL_NAMES = {"insert_element", "modify_element", "remove_element", "replace_element", "clear"}
+
+
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
     # repeat the elements, supports both tensor and numpy array
     if isinstance(value, torch.Tensor):
@@ -203,6 +206,10 @@ class vLLMRollout(BaseRollout):
         if not self.tool_schemas:
             return raw_prompt
 
+        tool_names = {tool_schema.function.name for tool_schema in self.tool_schemas}
+        if not tool_names.issubset(CANVAS_TOOL_NAMES):
+            return raw_prompt
+
         if raw_prompt and raw_prompt[0].get("role") == "system":
             return raw_prompt
 
@@ -325,29 +332,41 @@ class vLLMRollout(BaseRollout):
     def _call_tool(
         self,
         function_call,
-    ) -> tuple[ToolResponse, float, dict]:
+        instance_id: Optional[str] = None,
+    ) -> tuple[ToolResponse, float, dict, Optional[str]]:
         """Execute one parsed tool call and return a normalized ToolResponse."""
         if function_call.name not in self.tools:
-            return ToolResponse(text=f"Unknown tool: {function_call.name}"), 0.0, {}
+            return ToolResponse(text=f"Unknown tool: {function_call.name}"), 0.0, {}, instance_id
 
         tool = self.tools[function_call.name]
         try:
             tool_args = json.loads(function_call.arguments)
         except Exception as exc:
-            return ToolResponse(text=f"Invalid tool arguments: {exc}"), 0.0, {}
+            return ToolResponse(text=f"Invalid tool arguments: {exc}"), 0.0, {}, instance_id
 
-        instance_id, _ = self._run_async_tool(tool.create())
         try:
-            tool_response, _, _ = self._run_async_tool(
+            if instance_id is None:
+                instance_id, _ = self._run_async_tool(tool.create())
+            tool_response, tool_reward, tool_metrics = self._run_async_tool(
                 tool.execute(instance_id=instance_id, parameters=tool_args)
             )
         except Exception as exc:
-            return ToolResponse(text=f"Error when executing tool: {exc}"), 0.0, {}
-        finally:
-            self._run_async_tool(tool.release(instance_id))
+            return ToolResponse(text=f"Error when executing tool: {exc}"), 0.0, {}, instance_id
 
         tool_response.text = self._truncate_tool_text(tool_response.text)
-        return tool_response, 0.0, {}
+        return tool_response, tool_reward, tool_metrics, instance_id
+
+    def _release_tool_instance(self, instance_id: Optional[str]) -> None:
+        """Release one trajectory-level tool state after the sample finishes."""
+        if instance_id is None or not self.tools:
+            return
+
+        first_tool = next(iter(self.tools.values()))
+        self._run_async_tool(first_tool.release(instance_id))
+
+    def _format_tool_observation_text(self, text: Optional[str]) -> str:
+        """Wrap tool text in the observation contract expected by the Canvas prompt."""
+        return f"<tool_response>{text or ''}</tool_response>"
     
     def _tool_response_to_message(self, tool_response: ToolResponse) -> dict[str, Any]:
         """Convert one ToolResponse into a tool-role chat message."""
@@ -357,11 +376,10 @@ class vLLMRollout(BaseRollout):
                 content.append({"type": "image"})
             if tool_response.video:
                 content.append({"type": "video"})
-            if tool_response.text:
-                content.append({"type": "text", "text": tool_response.text})
+            content.append({"type": "text", "text": self._format_tool_observation_text(tool_response.text)})
             return {"role": "tool", "content": content}
 
-        return {"role": "tool", "content": tool_response.text or ""}
+        return {"role": "tool", "content": self._format_tool_observation_text(tool_response.text)}
     
     def _merge_multi_modal_data(
         self,
@@ -403,89 +421,112 @@ class vLLMRollout(BaseRollout):
         user_turns = 0
         tool_call_count = 0
         tool_failure_count = 0
+        tool_reward_sum = 0.0
         stop_reason = "max_response_length"
+        tool_instance_id: Optional[str] = None
 
-        while len(response_mask_chunks) < self.config.response_length:
-            assistant_turns += 1
-            if (
-                self.config.multi_turn.max_assistant_turns is not None
-                and assistant_turns > self.config.multi_turn.max_assistant_turns
-            ):
-                stop_reason = "max_assistant_turns"
-                break
+        try:
+            while len(response_mask_chunks) < self.config.response_length:
+                assistant_turns += 1
+                if (
+                    self.config.multi_turn.max_assistant_turns is not None
+                    and assistant_turns > self.config.multi_turn.max_assistant_turns
+                ):
+                    stop_reason = "max_assistant_turns"
+                    break
 
-            prompt_text = self._apply_chat_template_from_raw_prompt(messages)
-            prompt_token_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
-            if len(prompt_token_ids) > self.config.prompt_length:
-                prompt_token_ids = prompt_token_ids[: self.config.prompt_length]
-            
-            vllm_input = {"prompt_token_ids": prompt_token_ids}
-            if current_multi_modal_data is not None:
-                vllm_input["multi_modal_data"] = _process_multi_modal_data(
-                    current_multi_modal_data,
-                    meta_info["min_pixels"],
-                    meta_info["max_pixels"],
-                    meta_info["video_fps"],
-                    return_video_metadata=self.return_video_metadata,
+                prompt_text = self._apply_chat_template_from_raw_prompt(messages)
+                prompt_token_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+                if len(prompt_token_ids) > self.config.prompt_length:
+                    prompt_token_ids = prompt_token_ids[: self.config.prompt_length]
+
+                vllm_input = {"prompt_token_ids": prompt_token_ids}
+                if current_multi_modal_data is not None:
+                    vllm_input["multi_modal_data"] = _process_multi_modal_data(
+                        current_multi_modal_data,
+                        meta_info["min_pixels"],
+                        meta_info["max_pixels"],
+                        meta_info["video_fps"],
+                        return_video_metadata=self.return_video_metadata,
+                    )
+
+                with self.update_sampling_params(**meta_info):
+                    old_n = self.sampling_params.n
+                    self.sampling_params.n = 1
+                    try:
+                        completion = self.inference_engine.generate(
+                            prompts=[vllm_input],
+                            sampling_params=self.sampling_params,
+                            lora_request=self._build_lora_requests(1),
+                            use_tqdm=False,
+                        )[0]
+                    finally:
+                        self.sampling_params.n = old_n
+
+                generated_ids = completion.outputs[0].token_ids
+                response_token_chunks.extend(generated_ids)
+                response_mask_chunks.extend([1] * len(generated_ids))
+
+                if len(response_mask_chunks) >= self.config.response_length:
+                    stop_reason = "max_response_length"
+                    break
+
+                if self.tool_parser is None:
+                    stop_reason = "no_tool_parser"
+                    break
+
+                assistant_text, function_calls = self.tool_parser.extract_tool_calls(generated_ids)
+                messages.append({"role": "assistant", "content": assistant_text})
+
+                if not function_calls:
+                    stop_reason = "finished_no_tool_call"
+                    break
+
+                tool_messages = []
+                prompt_before_tool_ids = self.tokenizer.encode(
+                    self._apply_chat_template_from_raw_prompt(messages), add_special_tokens=False
                 )
+                for function_call in function_calls[: self.config.multi_turn.max_parallel_calls]:
+                    tool_call_count += 1
+                    tool_response, tool_reward, _, tool_instance_id = self._call_tool(function_call, tool_instance_id)
+                    tool_reward_sum += tool_reward
+                    if tool_response.text and (
+                        tool_response.text.startswith("Error when executing tool:")
+                        or tool_response.text.startswith("Unknown tool:")
+                        or tool_response.text.startswith("Invalid tool arguments:")
+                    ):
+                        tool_failure_count += 1
+                    tool_message = self._tool_response_to_message(tool_response)
+                    tool_messages.append(tool_message)
+                    current_multi_modal_data = self._merge_multi_modal_data(current_multi_modal_data, tool_response)
 
-            with self.update_sampling_params(**meta_info):
-                old_n = self.sampling_params.n
-                self.sampling_params.n = 1
-                try:
-                    completion = self.inference_engine.generate(
-                        prompts=[vllm_input],
-                        sampling_params=self.sampling_params,
-                        lora_request=self._build_lora_requests(1),
-                        use_tqdm=False,
-                    )[0]
-                finally:
-                    self.sampling_params.n = old_n
-            
-            generated_ids = completion.outputs[0].token_ids
-            response_token_chunks.extend(generated_ids)
-            response_mask_chunks.extend([1] * len(generated_ids))
+                if not tool_messages:
+                    stop_reason = "empty_tool_messages"
+                    break
 
-            if len(response_mask_chunks) >= self.config.response_length:
-                stop_reason = "max_response_length"
-                break
+                user_turns += 1
+                if (
+                    self.config.multi_turn.max_user_turns is not None
+                    and user_turns > self.config.multi_turn.max_user_turns
+                ):
+                    stop_reason = "max_user_turns"
+                    break
 
-            if self.tool_parser is None:
-                stop_reason = "no_tool_parser"
-                break
+                messages.extend(tool_messages)
+                prompt_after_tool_ids = self.tokenizer.encode(
+                    self._apply_chat_template_from_raw_prompt(messages), add_special_tokens=False
+                )
+                if prompt_after_tool_ids[: len(prompt_before_tool_ids)] == prompt_before_tool_ids:
+                    tool_token_ids = prompt_after_tool_ids[len(prompt_before_tool_ids) :]
+                else:
+                    tool_token_ids = self.tokenizer.encode(
+                        self._apply_chat_template_from_raw_prompt(tool_messages), add_special_tokens=False
+                    )
 
-            assistant_text, function_calls = self.tool_parser.extract_tool_calls(generated_ids)
-            messages.append({"role": "assistant", "content": assistant_text})
-
-            if not function_calls:
-                stop_reason = "finished_no_tool_call"
-                break
-
-            tool_messages = []
-            for function_call in function_calls[: self.config.multi_turn.max_parallel_calls]:
-                tool_call_count += 1
-                tool_response, _, _ = self._call_tool(function_call)
-                if tool_response.text and tool_response.text.startswith("Error when executing tool:"):
-                    tool_failure_count += 1
-                tool_message = self._tool_response_to_message(tool_response)
-                tool_messages.append(tool_message)
-                current_multi_modal_data = self._merge_multi_modal_data(current_multi_modal_data, tool_response)
-
-            if not tool_messages:
-                stop_reason = "empty_tool_messages"
-                break
-
-            user_turns += 1
-            if self.config.multi_turn.max_user_turns is not None and user_turns > self.config.multi_turn.max_user_turns:
-                stop_reason = "max_user_turns"
-                break
-
-            # Re-encode only the tool messages as observation tokens.
-            tool_prompt_text = self._apply_chat_template_from_raw_prompt(tool_messages)
-            tool_token_ids = self.tokenizer.encode(tool_prompt_text, add_special_tokens=False)
-            response_token_chunks.extend(tool_token_ids)
-            response_mask_chunks.extend([0] * len(tool_token_ids))
-            messages.extend(tool_messages)
+                response_token_chunks.extend(tool_token_ids)
+                response_mask_chunks.extend([0] * len(tool_token_ids))
+        finally:
+            self._release_tool_instance(tool_instance_id)
         
         trajectory_info = {
             "num_turns": assistant_turns + user_turns + 1,
@@ -493,6 +534,7 @@ class vLLMRollout(BaseRollout):
             "user_turns": user_turns,
             "tool_calls": tool_call_count,
             "tool_failures": tool_failure_count,
+            "tool_reward_sum": tool_reward_sum,
             "stop_reason": stop_reason,
         }
 
@@ -561,6 +603,7 @@ class vLLMRollout(BaseRollout):
             "agentic/avg_user_turns": float(np.mean([info["user_turns"] for info in traj_infos])),
             "agentic/avg_tool_calls": float(np.mean([info["tool_calls"] for info in traj_infos])),
             "agentic/avg_tool_failures": float(np.mean([info["tool_failures"] for info in traj_infos])),
+            "agentic/avg_tool_reward_sum": float(np.mean([info["tool_reward_sum"] for info in traj_infos])),
         }
     
     @torch.no_grad()
