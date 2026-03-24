@@ -1,4 +1,8 @@
-"""Canvas-task tool schemas for RL-side registration."""
+"""Canvas-task tool schemas for RL-side registration.
+
+This file keeps the Canvas tool contract aligned with the reference pipeline,
+but is rewritten locally for EasyR1.
+"""
 
 from typing import Any
 
@@ -9,8 +13,8 @@ canvas_tools: list[dict[str, Any]] = [
         "function": {
             "name": "insert_element",
             "description": (
-                "Insert a new SVG or HTML element into the notebook blackboard. "
-                "Use this for initial construction or adding new objects."
+                "Insert a new SVG or HTML element into the blackboard. "
+                "Used for initial construction or adding new objects."
             ),
             "parameters": {
                 "type": "object",
@@ -18,18 +22,25 @@ canvas_tools: list[dict[str, Any]] = [
                     "fragment": {
                         "type": "string",
                         "description": (
-                            "The HTML or SVG string to insert. "
-                            "If using SVG, it must contain xmlns='http://www.w3.org/2000/svg'. "
-                            "The inserted tag must include a unique id."
+                            "(1) The HTML string to insert. "
+                            "(2) An `svg` tag MUST be placed within a tag containing "
+                            "`xmlns=\"http://www.w3.org/2000/svg\"`. "
+                            "(3) Must include an `id` attribute inside the tag."
                         ),
                     },
                     "rootId": {
                         "type": "string",
-                        "description": "Parent container id. Use 'root' unless a different parent is required.",
+                        "description": (
+                            "The ID of the parent container to append to. "
+                            "Defaults to `root` if omitted."
+                        ),
                     },
                     "beforeId": {
-                        "type": "string",
-                        "description": "Optional sibling id to insert before.",
+                        "type": ["string", "null"],
+                        "description": (
+                            "The ID of an existing sibling element to insert this new "
+                            "element before. If null, appends to the end."
+                        ),
                     },
                 },
                 "required": ["fragment", "rootId"],
@@ -40,20 +51,25 @@ canvas_tools: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "modify_element",
-            "description": "Update attributes or text content of an existing element without redrawing it.",
+            "description": (
+                "Update specific attributes of an existing element. "
+                "Use this for movement, color changes, or state updates "
+                "without redrawing."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "targetId": {
                         "type": "string",
-                        "description": "The id of the element to modify.",
+                        "description": "The `id` of the element to modify.",
                     },
                     "attrs": {
                         "type": "object",
                         "description": (
-                            "Key-value attributes to update. "
-                            "Use key='text' to replace the inner text of a text-like element."
+                            "Key-value pairs of attributes to update. "
+                            "E.g., {'cx': '100', 'fill': '#ED2633', 'text': 'New Value'}."
                         ),
+                        "additionalProperties": True,
                     },
                 },
                 "required": ["targetId", "attrs"],
@@ -64,13 +80,13 @@ canvas_tools: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "remove_element",
-            "description": "Remove one element from the notebook blackboard.",
+            "description": "Remove an element from the blackboard.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "targetId": {
                         "type": "string",
-                        "description": "The id of the element to remove.",
+                        "description": "The `id` of the element to remove.",
                     }
                 },
                 "required": ["targetId"],
@@ -81,17 +97,17 @@ canvas_tools: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_element",
-            "description": "Replace one existing element with a new HTML or SVG fragment.",
+            "description": "Completely replace an existing element with a new code fragment.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "targetId": {
                         "type": "string",
-                        "description": "The id of the element being replaced.",
+                        "description": "The `id` of the old element to be replaced.",
                     },
                     "fragment": {
                         "type": "string",
-                        "description": "The new HTML or SVG fragment.",
+                        "description": "The new HTML/SVG string.",
                     },
                 },
                 "required": ["targetId", "fragment"],
@@ -102,11 +118,10 @@ canvas_tools: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "clear",
-            "description": "Clear the whole notebook blackboard. Use only for full reset.",
+            "description": "Clear all elements. Use only for full resets.",
             "parameters": {
                 "type": "object",
                 "properties": {},
-                "required": [],
             },
         },
     },
