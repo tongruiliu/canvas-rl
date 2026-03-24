@@ -1,1 +1,1 @@
-Agentic rl for canvas(support multimodal inputs).
+Agentic RL with canvas (support multimodal inputs).

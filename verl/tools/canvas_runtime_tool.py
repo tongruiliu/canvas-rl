@@ -7,6 +7,12 @@ from typing import Any, Optional
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from playwright.sync_api import sync_playwright
 
+import tempfile
+from uuid import uuid4
+
+from .base_tool import BaseTool
+from .schemas import ToolResponse
+
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -348,3 +354,50 @@ class CanvasNotebookState:
     def clear(self) -> None:
         """Wrapper for clear tool semantics."""
         self.update_state("clear", {})
+
+
+class CanvasRuntimeTool(BaseTool):
+
+    def __init__(self, config: dict, tool_schema=None):
+        super().__init__(config=config, tool_schema=tool_schema)
+        self._states: dict[str, CanvasNotebookState] = {}
+
+    async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
+        """Create one isolated notebook state for the current rollout instance."""
+        instance_id = instance_id or str(uuid4())
+        self._states[instance_id] = CanvasNotebookState()
+        return instance_id, ToolResponse(text="canvas notebook created")
+
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        """Dispatch one Canvas operation and render the latest notebook image."""
+        if instance_id not in self._states:
+            raise ValueError(f"Unknown canvas instance: {instance_id}")
+
+        state = self._states[instance_id]
+        operation = self.name
+
+        if operation == "insert_element":
+            state.insert_element(**parameters)
+        elif operation == "modify_element":
+            state.modify_element(**parameters)
+        elif operation == "remove_element":
+            state.remove_element(**parameters)
+        elif operation == "replace_element":
+            state.replace_element(**parameters)
+        elif operation == "clear":
+            state.clear()
+        else:
+            raise ValueError(f"Unsupported canvas operation: {operation}")
+
+        render_dir = self.config.get("render_dir") or tempfile.gettempdir()
+        render_path = os.path.join(render_dir, f"canvas-{instance_id}-{self.name}.png")
+        render_result = state.render_state(render_path)
+
+        if render_result != "tool execute success":
+            return ToolResponse(text=render_result), 0.0, {"render_ok": False}
+
+        return ToolResponse(text=render_result, image=[render_path]), 0.0, {"render_ok": True}
+
+    async def release(self, instance_id: str, **kwargs) -> None:
+        """Release the notebook state after the rollout trajectory finishes."""
+        self._states.pop(instance_id, None)

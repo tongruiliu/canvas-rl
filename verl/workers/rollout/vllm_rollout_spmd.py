@@ -38,6 +38,7 @@ from .config import RolloutConfig
 
 from ...tools import ToolResponse, initialize_tools_from_config
 from .tool_parser import ToolParser
+from ...tools.canvas_prompting import build_canvas_system_prompt
 
 
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
@@ -197,8 +198,47 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
     
+    def _maybe_prepend_canvas_system_prompt(self, raw_prompt: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Prepend a Canvas system prompt when Canvas tools are active."""
+        if not self.tool_schemas:
+            return raw_prompt
+
+        if raw_prompt and raw_prompt[0].get("role") == "system":
+            return raw_prompt
+
+        tool_schema_dicts = []
+        for tool_schema in self.tool_schemas:
+            properties = {}
+            for key, value in tool_schema.function.parameters.properties.items():
+                properties[key] = {
+                    "type": value.type,
+                    "description": value.description,
+                }
+                if value.enum is not None:
+                    properties[key]["enum"] = value.enum
+                if getattr(value, "additionalProperties", None) is not None:
+                    properties[key]["additionalProperties"] = value.additionalProperties
+
+            tool_schema_dicts.append(
+                {
+                    "type": tool_schema.type,
+                    "function": {
+                        "name": tool_schema.function.name,
+                        "description": tool_schema.function.description,
+                        "parameters": {
+                            "type": tool_schema.function.parameters.type,
+                            "properties": properties,
+                            "required": tool_schema.function.parameters.required,
+                        },
+                    },
+                }
+            )
+
+        system_prompt = build_canvas_system_prompt(tool_schema_dicts)
+        return [{"role": "system", "content": system_prompt}] + raw_prompt
+    
     def _apply_chat_template_from_raw_prompt(self, raw_prompt: list[dict[str, Any]]) -> str:
-        # agentic process
+        raw_prompt = self._maybe_prepend_canvas_system_prompt(list(raw_prompt))
         if self.processor is not None:
             return self.processor.apply_chat_template(raw_prompt, add_generation_prompt=True, tokenize=False)
         return self.tokenizer.apply_chat_template(raw_prompt, add_generation_prompt=True, tokenize=False)
