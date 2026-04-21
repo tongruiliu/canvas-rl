@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .base import BasePPOActor
 from .config import ActorConfig, FSDPConfig, LoraConfig, MegatronConfig, ModelConfig, OptimConfig, RefConfig
 
 
 __all__ = [
     "ActorConfig",
+    "BasePPOActor",
     "FSDPConfig",
     "LoraConfig",
     "MegatronConfig",

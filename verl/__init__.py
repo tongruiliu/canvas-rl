@@ -14,6 +14,7 @@
 
 import os
 
+from .protocol import DataProto
 from .utils.py_functional import is_package_available
 
 

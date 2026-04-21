@@ -1,4 +1,5 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# VANILLA_MBRIDGE
+try:
+    from mbridge import AutoBridge
+    from mbridge.utils.post_creation_callbacks import freeze_moe_router, make_value_model
+except ImportError:
+    print("mbridge package not found. Please install mbridge with `pip install verl[mcore]` or `pip install mbridge`")
+    raise
 
-from .logger import Tracker
-from .aggregate_logger import DecoratorLoggerBase, log_with_rank, print_rank_0, print_with_rank, print_with_rank_and_timer
-
-
-__all__ = [
-    "DecoratorLoggerBase",
-    "Tracker",
-    "log_with_rank",
-    "print_rank_0",
-    "print_with_rank",
-    "print_with_rank_and_timer",
-]
+__all__ = ["AutoBridge", "make_value_model", "freeze_moe_router"]

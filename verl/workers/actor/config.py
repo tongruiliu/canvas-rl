@@ -107,6 +107,7 @@ class MegatronConfig:
     seed: int = 42
     use_mbridge: bool = True
     vanilla_mbridge: bool = True
+    use_remove_padding: bool = True
     override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
 

@@ -17,6 +17,7 @@ Contain small torch utilities
 """
 
 import math
+from contextlib import contextmanager
 from typing import List, Literal, Optional, Tuple, Union
 
 import torch
@@ -392,3 +393,16 @@ class AnyPrecisionAdamW(torch.optim.Optimizer):
                     compensation.add_(temp_buffer.sub_(p.data))
                 else:  # usual AdamW updates
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
+
+
+def broadcast_dict_tensor(tensors: dict[str, torch.Tensor], src: int, group) -> None:
+    """Broadcast all tensors in a dictionary from `src` within `group`."""
+    keys = tensors.sorted_keys if hasattr(tensors, "sorted_keys") else sorted(tensors.keys())
+    for key in keys:
+        torch.distributed.broadcast(tensors[key], src=src, group=group, async_op=False)
+
+
+@contextmanager
+def use_original_torch_compile():
+    """Compatibility no-op for Megatron code paths that may run under MindSpeed."""
+    yield

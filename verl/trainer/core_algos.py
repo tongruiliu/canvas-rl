@@ -407,6 +407,49 @@ def average_loss(
         raise NotImplementedError(f"Unknown mode: {mode}.")
 
 
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str) -> torch.Tensor:
+    """Megatron actor compatible loss aggregation wrapper."""
+    if loss_agg_mode in ("token", "token-mean"):
+        return average_loss(loss_mat, loss_mask, mode="token")
+    if loss_agg_mode in ("seq", "seq-mean", "seq-mean-token-sum"):
+        return average_loss(loss_mat, loss_mask, mode="seq")
+    raise NotImplementedError(f"Unknown loss aggregation mode: {loss_agg_mode}.")
+
+
+def get_policy_loss_fn(name: str):
+    """Return a Megatron actor compatible policy-loss callable."""
+    if name not in ("vanilla", "default", "gspo", "gspo_token", "cispo", "sapo"):
+        raise NotImplementedError(f"Unsupported policy loss mode for canvas-rl Megatron path: {name}.")
+
+    def policy_loss_fn(
+        old_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        loss_agg_mode: str,
+        config,
+        rollout_is_weights=None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        loss_type = "default" if name == "vanilla" else name
+        loss_avg_mode = "seq" if loss_agg_mode.startswith("seq") else "token"
+        return compute_policy_loss(
+            old_log_probs=old_log_prob,
+            log_probs=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            clip_ratio_low=getattr(config, "clip_ratio_low", 0.2),
+            clip_ratio_high=getattr(config, "clip_ratio_high", 0.3),
+            clip_ratio_dual=getattr(config, "clip_ratio_dual", 3.0),
+            tau_positive=getattr(config, "tau_positive", 1.0),
+            tau_negative=getattr(config, "tau_negative", 1.05),
+            loss_type=loss_type,
+            loss_avg_mode=loss_avg_mode,
+        )
+
+    return policy_loss_fn
+
+
 def compute_policy_loss(
     old_log_probs: torch.Tensor,
     log_probs: torch.Tensor,
@@ -597,3 +640,7 @@ def compute_kl(
         return F.kl_div(ref_log_probs, log_probs, log_target=True, reduction="none").sum(-1)
 
     raise NotImplementedError(f"Unknown KL penalty: {kl_penalty}.")
+
+
+def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty: str) -> torch.Tensor:
+    return compute_kl(log_probs=logprob, ref_log_probs=ref_logprob, kl_penalty=kl_penalty)

@@ -12,16 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-from .logger import Tracker
-from .aggregate_logger import DecoratorLoggerBase, log_with_rank, print_rank_0, print_with_rank, print_with_rank_and_timer
+from typing import Callable, Optional
 
 
-__all__ = [
-    "DecoratorLoggerBase",
-    "Tracker",
-    "log_with_rank",
-    "print_rank_0",
-    "print_with_rank",
-    "print_with_rank_and_timer",
-]
+def mark_start_range(
+    message: Optional[str] = None,
+    color: Optional[str] = None,
+    domain: Optional[str] = None,
+    category: Optional[str] = None,
+) -> None:
+    pass
+
+
+def mark_end_range(range_id: str) -> None:
+    pass
+
+
+def mark_annotate(
+    message: Optional[str] = None,
+    color: Optional[str] = None,
+    domain: Optional[str] = None,
+    category: Optional[str] = None,
+) -> Callable:
+    def decorator(func):
+        return func
+
+    return decorator
