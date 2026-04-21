@@ -113,6 +113,26 @@ def _mean_metric(value):
     return value
 
 
+def _rng_state() -> dict:
+    state = {
+        "cpu": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "random": random.getstate(),
+    }
+    if get_torch_device().device_count() > 0:
+        state[get_torch_device().__name__.rsplit(".", 1)[-1]] = get_torch_device().get_rng_state()
+    return state
+
+
+def _load_rng_state(state: dict) -> None:
+    torch.set_rng_state(state["cpu"])
+    np.random.set_state(state["numpy"])
+    random.setstate(state["random"])
+    device_key = get_torch_device().__name__.rsplit(".", 1)[-1]
+    if device_key in state:
+        get_torch_device().set_rng_state(state[device_key])
+
+
 class AsyncActorRolloutRefWorker(Worker):
     """Actor/rollout/ref worker for Megatron actor/ref training operations."""
 
@@ -431,6 +451,21 @@ class AsyncActorRolloutRefWorker(Worker):
             use_param_offload=self._is_offload_param,
         )
 
+    def _checkpoint_rank_path(self, path: str, name: str) -> str:
+        return os.path.join(path, f"{name}_world_size_{self.world_size}_rank_{self.rank}.pt")
+
+    def _save_hf_assets(self, path: str) -> None:
+        if self.rank != 0:
+            return
+        hf_path = os.path.join(path, "huggingface")
+        os.makedirs(hf_path, exist_ok=True)
+        self.hf_config.save_pretrained(hf_path)
+        if self.generation_config is not None:
+            self.generation_config.save_pretrained(hf_path)
+        processing_class = self.processor if self.processor is not None else self.tokenizer
+        if processing_class is not None:
+            processing_class.save_pretrained(hf_path)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         if self._is_lora:
@@ -640,7 +675,40 @@ class AsyncActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, path: str, save_model_only: bool = False):
-        raise NotImplementedError("Megatron checkpoint save is not ported in canvas-rl yet.")
+        assert self._has_actor
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.actor_module)
+        if self._is_offload_optimizer and not save_model_only:
+            load_megatron_optimizer(self.actor_optimizer)
+
+        if self.rank == 0:
+            os.makedirs(path, exist_ok=True)
+        dist.barrier()
+
+        model_path = self._checkpoint_rank_path(path, "model")
+        model_state = [module.state_dict() for module in self.actor_module]
+        print(f"[rank-{self.rank}]: Saving Megatron model shard to {os.path.abspath(model_path)}.")
+        torch.save(model_state, model_path)
+
+        if not save_model_only:
+            optim_path = self._checkpoint_rank_path(path, "optim")
+            extra_path = self._checkpoint_rank_path(path, "extra_state")
+            extra_state = {
+                "rng": _rng_state(),
+                "actor_optimizer_scheduler": self.actor_optimizer_scheduler.state_dict(),
+            }
+            print(f"[rank-{self.rank}]: Saving Megatron optimizer shard to {os.path.abspath(optim_path)}.")
+            print(f"[rank-{self.rank}]: Saving Megatron extra state to {os.path.abspath(extra_path)}.")
+            torch.save(self.actor_optimizer.state_dict(), optim_path)
+            torch.save(extra_state, extra_path)
+
+        self._save_hf_assets(path)
+        dist.barrier()
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+        if self._is_offload_optimizer and not save_model_only:
+            offload_megatron_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path: Optional[str]):
@@ -650,36 +718,382 @@ class AsyncActorRolloutRefWorker(Worker):
             if self._has_actor and self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
             return
-        raise NotImplementedError("Megatron checkpoint load is not ported in canvas-rl yet.")
+
+        assert self._has_actor
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.actor_module)
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.actor_optimizer)
+
+        model_path = self._checkpoint_rank_path(path, "model")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Megatron checkpoint shard not found: {model_path}. "
+                "The minimal canvas-rl Megatron checkpoint loader requires the same world size/topology."
+            )
+
+        print(f"[rank-{self.rank}]: Loading Megatron model shard from {os.path.abspath(model_path)}.")
+        model_state = torch.load(model_path, map_location="cpu", weights_only=False)
+        if len(model_state) != len(self.actor_module):
+            raise ValueError(f"Checkpoint has {len(model_state)} model chunks, expected {len(self.actor_module)}.")
+        for module, state in zip(self.actor_module, model_state, strict=True):
+            module.load_state_dict(state)
+
+        optim_path = self._checkpoint_rank_path(path, "optim")
+        extra_path = self._checkpoint_rank_path(path, "extra_state")
+        if os.path.exists(optim_path):
+            print(f"[rank-{self.rank}]: Loading Megatron optimizer shard from {os.path.abspath(optim_path)}.")
+            self.actor_optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
+        if os.path.exists(extra_path):
+            print(f"[rank-{self.rank}]: Loading Megatron extra state from {os.path.abspath(extra_path)}.")
+            extra_state = torch.load(extra_path, map_location="cpu", weights_only=False)
+            if "actor_optimizer_scheduler" in extra_state:
+                self.actor_optimizer_scheduler.load_state_dict(extra_state["actor_optimizer_scheduler"])
+            if "rng" in extra_state:
+                _load_rng_state(extra_state["rng"])
+
+        dist.barrier()
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.actor_optimizer)
 
 
 class CriticWorker(Worker):
-    """Critic worker placeholder for the Megatron backend."""
+    """Critic worker for Megatron value-model operations."""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self._register_dispatch_collect_info(mesh_name="critic", dp_rank=self.rank, is_collect=True)
+        self._cache = {}
+        self._init_distributed()
+        self._register_critic_mesh()
+        self._is_offload_param = self.config.megatron.param_offload
+        self._is_offload_optimizer = self.config.megatron.optimizer_offload
+        _set_random_seed(self.config.megatron.seed)
 
-    def _raise_pending(self):
-        raise NotImplementedError(_CRITIC_PENDING_MESSAGE)
+    def _init_distributed(self) -> None:
+        if not dist.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            dist.init_process_group(
+                backend=get_nccl_backend(),
+                timeout=datetime.timedelta(seconds=int(getattr(self.config, "nccl_timeout", 600))),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
+            get_torch_device().set_device(local_rank)
+
+        if not mpu.model_parallel_is_initialized():
+            mpu.initialize_model_parallel(
+                tensor_model_parallel_size=self.config.megatron.tensor_model_parallel_size,
+                pipeline_model_parallel_size=self.config.megatron.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=self.config.megatron.virtual_pipeline_model_parallel_size,
+                use_sharp=False,
+                context_parallel_size=self.config.megatron.context_parallel_size,
+                expert_model_parallel_size=self.config.megatron.expert_model_parallel_size,
+                expert_tensor_parallel_size=self.config.megatron.expert_tensor_parallel_size,
+                nccl_communicator_config_path=None,
+            )
+
+    def _register_critic_mesh(self) -> None:
+        is_collect = (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+            and _get_context_parallel_rank() == 0
+        )
+        self._register_dispatch_collect_info(
+            mesh_name="critic", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
+        )
+
+    def _critic_runtime_config(self):
+        dp_size = mpu.get_data_parallel_world_size()
+        ppo_mini_batch_size = max(1, self.config.global_batch_size // dp_size)
+        return OmegaConf.create(
+            {
+                "ppo_mini_batch_size": ppo_mini_batch_size,
+                "ppo_micro_batch_size_per_gpu": self.config.micro_batch_size_per_device_for_update,
+                "ppo_epochs": self.config.ppo_epochs,
+                "shuffle": False,
+                "data_loader_seed": None,
+                "cliprange_value": self.config.cliprange_value,
+                "loss_agg_mode": self.config.loss_avg_mode,
+                "use_dynamic_bsz": False,
+                "ppo_max_token_len_per_gpu": None,
+                "rollout_n": 1,
+                "ulysses_sequence_parallel_size": 1,
+                "megatron": _as_plain_dict(self.config.megatron),
+            }
+        )
+
+    def _optimizer_config(self):
+        optim_cfg = self.config.optim
+        training_steps = max(1, int(optim_cfg.training_steps if optim_cfg.training_steps > 0 else 1))
+        warmup_steps = optim_cfg.lr_warmup_steps
+        if warmup_steps is None:
+            warmup_steps = int(optim_cfg.lr_warmup_ratio * training_steps)
+        min_lr = 0.0
+        if optim_cfg.min_lr_ratio is not None:
+            min_lr = optim_cfg.lr * optim_cfg.min_lr_ratio
+        return OmegaConf.create(
+            {
+                "optimizer": "adam",
+                "lr": optim_cfg.lr,
+                "min_lr": min_lr,
+                "clip_grad": self.config.max_grad_norm,
+                "weight_decay": optim_cfg.weight_decay,
+                "total_training_steps": training_steps,
+                "lr_decay_steps": training_steps,
+                "lr_warmup_steps": warmup_steps,
+                "lr_warmup_steps_ratio": None,
+                "lr_warmup_init": 0.0,
+                "lr_decay_style": optim_cfg.lr_scheduler_type,
+                "weight_decay_incr_style": "constant",
+                "use_checkpoint_opt_param_scheduler": False,
+                "override_optimizer_config": {"adam_beta1": optim_cfg.betas[0], "adam_beta2": optim_cfg.betas[1]},
+                "lr_wsd_decay_steps": None,
+                "lr_wsd_decay_style": "exponential",
+            }
+        )
+
+    def _init_hf_config_and_tf_config(self) -> None:
+        model_config = self.config.model
+        self.local_path = copy_to_local(model_config.model_path)
+        local_tokenizer_path = copy_to_local(model_config.tokenizer_path or model_config.model_path)
+        self.tokenizer = get_tokenizer(local_tokenizer_path, trust_remote_code=model_config.trust_remote_code, use_fast=True)
+        self.processor = get_processor(local_tokenizer_path, trust_remote_code=model_config.trust_remote_code, use_fast=True)
+        hf_config = AutoConfig.from_pretrained(
+            self.local_path,
+            trust_remote_code=model_config.trust_remote_code,
+            bos_token_id=self.tokenizer.bos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        override_config_kwargs = _as_plain_dict(model_config.override_config)
+        override_config_kwargs.update(
+            {
+                "bos_token_id": self.tokenizer.bos_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+            }
+        )
+        update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
+        self.architectures = getattr(hf_config, "architectures", None) or []
+
+        if not self.config.megatron.use_mbridge:
+            raise NotImplementedError("canvas-rl Megatron critic currently requires megatron.use_mbridge=True.")
+
+        override_transformer_config = _as_plain_dict(self.config.megatron.override_transformer_config)
+        from ..models.mcore.config_converter import mapping_string_to_attn_backend
+        from ..models.mcore.mbridge import AutoBridge
+
+        bridge = AutoBridge.from_config(hf_config, dtype=self.dtype)
+        bridge.set_extra_args(**mapping_string_to_attn_backend(override_transformer_config))
+        tf_config = bridge.config
+        tf_config.fp16 = self.dtype == torch.float16
+        tf_config.bf16 = self.dtype == torch.bfloat16
+
+        self.bridge = bridge
+        self.provider = None
+        self.hf_config = hf_config
+        self.tf_config = tf_config
+
+    def _build_critic_model_optimizer(self):
+        self._init_hf_config_and_tf_config()
+        wrap_config = McoreModuleWrapperConfig(
+            is_value_model=True,
+            share_embeddings_and_output_weights=False,
+            wrap_with_ddp=True,
+            use_distributed_optimizer=self.config.megatron.use_distributed_optimizer,
+        )
+        critic_module, updated_tf_config = make_megatron_module(
+            wrap_config=wrap_config,
+            tf_config=self.tf_config,
+            hf_config=self.hf_config,
+            bridge=self.bridge,
+            provider=self.provider,
+            override_model_config=_as_plain_dict(self.config.model.override_config),
+            override_ddp_config=_as_plain_dict(self.config.megatron.override_ddp_config),
+            peft_cls=None,
+            peft_config=None,
+        )
+        self.tf_config = updated_tf_config
+
+        if self.config.load_weight:
+            if self.config.megatron.use_dist_checkpointing:
+                load_mcore_dist_weights(
+                    critic_module,
+                    self.config.megatron.dist_checkpointing_path,
+                    is_value_model=True,
+                    prefix=self.config.megatron.dist_checkpointing_prefix,
+                )
+            else:
+                self.bridge.load_weights(critic_module, self.local_path)
+
+        if self.rank == 0:
+            print_model_size(critic_module[0])
+
+        optim_config = self._optimizer_config()
+        optim_config_megatron = init_megatron_optim_config(
+            optim_config,
+            use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+            fp16=self.dtype == torch.float16,
+        )
+        critic_optimizer = get_megatron_optimizer(model=critic_module, config=optim_config_megatron)
+        critic_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
+            optimizer=critic_optimizer, config=optim_config
+        )
+        register_megatron_training_hooks(critic_module, critic_optimizer)
+        return critic_module, critic_optimizer, critic_optimizer_scheduler, self.hf_config, optim_config_megatron
+
+    def _checkpoint_rank_path(self, path: str, name: str) -> str:
+        return os.path.join(path, f"{name}_world_size_{self.world_size}_rank_{self.rank}.pt")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        self._raise_pending()
+        from .critic.megatron_critic import MegatronPPOCritic
+
+        self.param_dtype = PrecisionType.to_dtype(self.config.megatron.dtype)
+        self.dtype = self.param_dtype
+        (
+            self.critic_module,
+            self.critic_optimizer,
+            self.critic_optimizer_scheduler,
+            self.critic_model_config,
+            self.critic_optimizer_config,
+        ) = self._build_critic_model_optimizer()
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.critic_module)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.critic_optimizer)
+
+        self.critic_runtime_config = self._critic_runtime_config()
+        self.critic = MegatronPPOCritic(
+            config=self.critic_runtime_config,
+            model_config=self.critic_model_config,
+            hf_config=self.hf_config,
+            tf_config=self.tf_config,
+            critic_module=self.critic_module,
+            critic_optimizer=self.critic_optimizer,
+            critic_optimizer_config=self.critic_optimizer_config,
+        )
+        self.flops_counter = FlopsCounter(self.critic_model_config)
+        get_torch_device().empty_cache()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     def compute_values(self, data: DataProto):
-        self._raise_pending()
+        if "multi_modal_data" in data.non_tensor_batch or "multi_modal_inputs" in data.non_tensor_batch:
+            raise NotImplementedError("Megatron critic does not support multimodal value-model inputs yet.")
+        data = data.to(get_device_id())
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.critic_module, load_grad=False)
+
+        data.meta_info["micro_batch_size"] = self.config.micro_batch_size_per_device_for_experience
+        data.meta_info["max_token_len"] = None
+        data.meta_info["use_dynamic_bsz"] = False
+        values = self.critic.compute_values(data=data)
+        output = DataProto.from_dict(tensors={"values": values})
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.critic_module)
+        get_torch_device().empty_cache()
+        return output.to("cpu")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     def update_critic(self, data: DataProto):
-        self._raise_pending()
+        if "multi_modal_data" in data.non_tensor_batch or "multi_modal_inputs" in data.non_tensor_batch:
+            raise NotImplementedError("Megatron critic does not support multimodal value-model inputs yet.")
+        data = data.to(get_device_id())
+
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.critic_module)
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.critic_optimizer)
+
+        dataloader = self.critic.make_minibatch_iterator(data)
+        with Timer(name="update_critic", logger=None) as timer:
+            metrics = self.critic.update_critic(dataloader=dataloader)
+        delta_time = timer.last
+        if "global_token_num" in data.meta_info:
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(data.meta_info["global_token_num"], delta_time)
+            metrics["perf/mfu_critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+        metrics["critic/lr"] = get_megatron_last_lr(self.critic_optimizer)
+        self.critic_optimizer_scheduler.step(1)
+
+        output = DataProto(
+            non_tensor_batch={
+                key: np.array([_mean_metric(value)] if np.isscalar(_mean_metric(value)) else [_mean_metric(value)], dtype=object)
+                for key, value in metrics.items()
+            }
+        )
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.critic_module)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.critic_optimizer)
+        get_torch_device().empty_cache()
+        return output.to("cpu")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, path: str, save_model_only: bool = False):
-        self._raise_pending()
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.critic_module)
+        if self._is_offload_optimizer and not save_model_only:
+            load_megatron_optimizer(self.critic_optimizer)
+
+        if self.rank == 0:
+            os.makedirs(path, exist_ok=True)
+        dist.barrier()
+
+        model_path = self._checkpoint_rank_path(path, "model")
+        torch.save([module.state_dict() for module in self.critic_module], model_path)
+
+        if not save_model_only:
+            torch.save(self.critic_optimizer.state_dict(), self._checkpoint_rank_path(path, "optim"))
+            torch.save(
+                {"rng": _rng_state(), "critic_optimizer_scheduler": self.critic_optimizer_scheduler.state_dict()},
+                self._checkpoint_rank_path(path, "extra_state"),
+            )
+
+        dist.barrier()
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.critic_module)
+        if self._is_offload_optimizer and not save_model_only:
+            offload_megatron_optimizer(self.critic_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path: str):
-        self._raise_pending()
+        if path is None:
+            return
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.critic_module)
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.critic_optimizer)
+
+        model_path = self._checkpoint_rank_path(path, "model")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Megatron critic checkpoint shard not found: {model_path}. "
+                "The minimal canvas-rl Megatron checkpoint loader requires the same world size/topology."
+            )
+        model_state = torch.load(model_path, map_location="cpu", weights_only=False)
+        if len(model_state) != len(self.critic_module):
+            raise ValueError(f"Checkpoint has {len(model_state)} model chunks, expected {len(self.critic_module)}.")
+        for module, state in zip(self.critic_module, model_state, strict=True):
+            module.load_state_dict(state)
+
+        optim_path = self._checkpoint_rank_path(path, "optim")
+        extra_path = self._checkpoint_rank_path(path, "extra_state")
+        if os.path.exists(optim_path):
+            self.critic_optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
+        if os.path.exists(extra_path):
+            extra_state = torch.load(extra_path, map_location="cpu", weights_only=False)
+            if "critic_optimizer_scheduler" in extra_state:
+                self.critic_optimizer_scheduler.load_state_dict(extra_state["critic_optimizer_scheduler"])
+            if "rng" in extra_state:
+                _load_rng_state(extra_state["rng"])
+
+        dist.barrier()
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.critic_module)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.critic_optimizer)

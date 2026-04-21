@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .base import BasePPOCritic
 from .config import CriticConfig
 
 
-__all__ = ["CriticConfig"]
+__all__ = ["BasePPOCritic", "CriticConfig"]
