@@ -50,6 +50,22 @@ class WorkerConfig:
     def post_init(self):
         if self.actor.strategy == "megatron" and self.ref.strategy == "fsdp":
             self.ref.strategy = "megatron"
+        if self.actor.strategy == "megatron" and self.ref.strategy == "megatron":
+            for key in (
+                "tensor_model_parallel_size",
+                "expert_model_parallel_size",
+                "expert_tensor_parallel_size",
+                "pipeline_model_parallel_size",
+                "virtual_pipeline_model_parallel_size",
+                "context_parallel_size",
+                "sequence_parallel",
+                "dtype",
+                "seed",
+                "use_mbridge",
+                "vanilla_mbridge",
+                "use_remove_padding",
+            ):
+                setattr(self.ref.megatron, key, getattr(self.actor.megatron, key))
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
         self.ref.padding_free = self.actor.padding_free
         self.ref.dynamic_batching = self.actor.dynamic_batching

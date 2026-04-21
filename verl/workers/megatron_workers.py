@@ -23,6 +23,7 @@ weight-export/sync sharding manager before generation can run.
 import datetime
 import os
 import random
+from dataclasses import asdict, is_dataclass
 from typing import Literal, Optional
 
 import numpy as np
@@ -55,7 +56,7 @@ from ..utils.megatron_utils import (
     offload_megatron_optimizer,
     register_megatron_training_hooks,
 )
-from ..utils.model import get_generation_config, get_hf_model_path, load_mcore_dist_weights, update_model_config
+from ..utils.model import get_generation_config, load_mcore_dist_weights, update_model_config
 from ..utils.model_utils import print_model_size
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..utils.torch_dtypes import PrecisionType
@@ -100,6 +101,8 @@ def _as_plain_dict(value) -> dict:
         return value
     if OmegaConf.is_config(value):
         return OmegaConf.to_container(value, resolve=True)
+    if is_dataclass(value):
+        return asdict(value)
     return dict(value)
 
 
@@ -218,10 +221,7 @@ class AsyncActorRolloutRefWorker(Worker):
                 "ulysses_sequence_parallel_size": 1,
                 "profiler": {"tool": None},
                 "router_replay": {"mode": "disabled"},
-                "megatron": {
-                    **OmegaConf.to_container(OmegaConf.structured(actor_cfg.megatron), resolve=True),
-                    "use_remove_padding": actor_cfg.megatron.use_remove_padding,
-                },
+                "megatron": _as_plain_dict(actor_cfg.megatron),
             }
         )
 
@@ -247,10 +247,7 @@ class AsyncActorRolloutRefWorker(Worker):
                 "ulysses_sequence_parallel_size": 1,
                 "profiler": {"tool": None},
                 "router_replay": {"mode": "disabled"},
-                "megatron": {
-                    **OmegaConf.to_container(OmegaConf.structured(ref_cfg.megatron), resolve=True),
-                    "use_remove_padding": ref_cfg.megatron.use_remove_padding,
-                },
+                "megatron": _as_plain_dict(ref_cfg.megatron),
             }
         )
 
@@ -370,7 +367,7 @@ class AsyncActorRolloutRefWorker(Worker):
                     prefix=megatron_cfg.dist_checkpointing_prefix,
                 )
             else:
-                self.bridge.load_weights(actor_module, get_hf_model_path(self.config.actor.model))
+                self.bridge.load_weights(actor_module, self.local_path)
 
         if self.rank == 0:
             print_model_size(actor_module[0])
@@ -417,7 +414,7 @@ class AsyncActorRolloutRefWorker(Worker):
                     prefix=megatron_cfg.dist_checkpointing_prefix,
                 )
             else:
-                self.bridge.load_weights(ref_module, get_hf_model_path(self.config.actor.model))
+                self.bridge.load_weights(ref_module, self.local_path)
         return ref_module, self.hf_config
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
