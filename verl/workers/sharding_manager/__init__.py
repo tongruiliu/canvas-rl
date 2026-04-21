@@ -16,6 +16,12 @@
 from .base import BaseShardingManager
 from .fsdp_ulysses import FSDPUlyssesShardingManager
 from .fsdp_vllm import FSDPVLLMShardingManager
+from .megatron_vllm import MegatronVLLMShardingManager
 
 
-__all__ = ["BaseShardingManager", "FSDPUlyssesShardingManager", "FSDPVLLMShardingManager"]
+__all__ = [
+    "BaseShardingManager",
+    "FSDPUlyssesShardingManager",
+    "FSDPVLLMShardingManager",
+    "MegatronVLLMShardingManager",
+]

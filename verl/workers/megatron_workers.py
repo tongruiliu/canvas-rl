@@ -13,11 +13,10 @@
 # limitations under the License.
 """Megatron worker entry points for canvas-rl.
 
-This ports the training-side Megatron runtime boundary from verl far enough to
-initialize actor/reference MCore modules, compute log probabilities, and run PPO
-actor updates. The rollout engine is intentionally still a separate patch layer:
-canvas-rl's current rollout path is FSDP->vLLM specific and needs a Megatron
-weight-export/sync sharding manager before generation can run.
+This ports the Megatron runtime boundary from verl far enough to initialize
+actor/reference MCore modules, synchronize actor weights into canvas-rl's vLLM
+engine, compute log probabilities, run rollout generation, and run PPO actor
+updates.
 """
 
 import datetime
@@ -62,16 +61,6 @@ from ..utils.tokenizer import get_processor, get_tokenizer
 from ..utils.torch_dtypes import PrecisionType
 from .actor.megatron_actor import MegatronPPOActor
 
-
-_ROLLOUT_PENDING_MESSAGE = """
-Megatron actor/ref training runtime is wired, but rollout generation is not yet
-ported for canvas-rl.
-
-Next required patch layer:
-1. add Megatron->vLLM/SGLang weight export and sync;
-2. preserve canvas-rl's tool/multi-turn rollout request path;
-3. route rollout DP/TP/PP dispatch through the inference mesh.
-"""
 
 _CRITIC_PENDING_MESSAGE = """
 Megatron critic runtime is not ported yet. Actor/ref logprob and update are
@@ -149,10 +138,6 @@ class AsyncActorRolloutRefWorker(Worker):
         if self._has_actor or self._has_ref:
             self._init_distributed()
             self._register_actor_mesh()
-        if self._has_rollout:
-            # Until rollout sync is ported, keep rollout routed to all workers so
-            # calls fail with the explicit rollout message instead of dispatcher errors.
-            self._register_dispatch_collect_info(mesh_name="rollout", dp_rank=self.rank, is_collect=True)
 
         self._is_offload_param = self.config.actor.megatron.param_offload
         self._is_offload_grad = self.config.actor.megatron.grad_offload
@@ -417,6 +402,35 @@ class AsyncActorRolloutRefWorker(Worker):
                 self.bridge.load_weights(ref_module, self.local_path)
         return ref_module, self.hf_config
 
+    def _build_rollout(self) -> None:
+        if not self._has_actor:
+            raise NotImplementedError("Standalone Megatron rollout without colocated actor is not supported yet.")
+
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from .rollout import vLLMRollout
+        from .sharding_manager import MegatronVLLMShardingManager
+
+        tp_size = self.config.rollout.tensor_parallel_size
+        if self.world_size % tp_size != 0:
+            raise ValueError(f"rollout world size {self.world_size} is not divisible by tp size {tp_size}.")
+
+        dp_size = self.world_size // tp_size
+        rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+        self.rollout = vLLMRollout(
+            model_path=self.config.actor.model.model_path,
+            config=self.config.rollout,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+        )
+        self.rollout_sharding_manager = MegatronVLLMShardingManager(
+            actor_module=self.actor_module,
+            inference_engine=self.rollout.inference_engine,
+            bridge=self.bridge,
+            device_mesh=rollout_device_mesh,
+            use_param_offload=self._is_offload_param,
+        )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         if self._is_lora:
@@ -447,6 +461,9 @@ class AsyncActorRolloutRefWorker(Worker):
                 actor_optimizer=self.actor_optimizer,
             )
             self.flops_counter = FlopsCounter(self.actor_model_config)
+
+        if self._has_rollout:
+            self._build_rollout()
 
         if self._has_ref:
             self.ref_module, self.ref_model_config = self._build_ref_model()
@@ -594,17 +611,32 @@ class AsyncActorRolloutRefWorker(Worker):
         get_torch_device().empty_cache()
         return output.to("cpu")
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
-        raise NotImplementedError(_ROLLOUT_PENDING_MESSAGE)
+        assert self._has_rollout
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+        prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+        output = self.rollout.generate_sequences(prompts=prompts)
+        output = self.rollout_sharding_manager.postprocess_data(output)
+        return output.to("cpu")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def prepare_rollout_engine(self):
-        raise NotImplementedError(_ROLLOUT_PENDING_MESSAGE)
+        assert self._has_rollout
+        self.rollout_sharding_manager.load_vllm_and_sync_weights()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def release_rollout_engine(self):
-        raise NotImplementedError(_ROLLOUT_PENDING_MESSAGE)
+        assert self._has_rollout
+        self.rollout_sharding_manager.offload_vllm()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, path: str, save_model_only: bool = False):
