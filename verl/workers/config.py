@@ -17,7 +17,7 @@ ActorRolloutRef config
 
 from dataclasses import dataclass, field
 
-from .actor import ActorConfig, FSDPConfig, LoraConfig, ModelConfig, OptimConfig, RefConfig
+from .actor import ActorConfig, FSDPConfig, LoraConfig, MegatronConfig, ModelConfig, OptimConfig, RefConfig
 from .critic import CriticConfig
 from .reward import RewardConfig
 from .rollout import RolloutConfig
@@ -28,6 +28,7 @@ __all__ = [
     "CriticConfig",
     "FSDPConfig",
     "LoraConfig",
+    "MegatronConfig",
     "ModelConfig",
     "OptimConfig",
     "RefConfig",
@@ -47,6 +48,8 @@ class WorkerConfig:
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
 
     def post_init(self):
+        if self.actor.strategy == "megatron" and self.ref.strategy == "fsdp":
+            self.ref.strategy = "megatron"
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
         self.ref.padding_free = self.actor.padding_free
         self.ref.dynamic_batching = self.actor.dynamic_batching

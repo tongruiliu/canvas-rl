@@ -19,7 +19,6 @@ from omegaconf import OmegaConf
 
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
-from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import AutoRewardManager
 from .config import PPOConfig
 from .data_loader import create_dataloader
@@ -51,9 +50,23 @@ class Runner:
 
         # define worker classes
         ray_worker_group_cls = RayWorkerGroup
+        if config.worker.actor.strategy == "megatron":
+            from ..workers.megatron_workers import AsyncActorRolloutRefWorker as ActorRolloutRefWorker
+        elif config.worker.actor.strategy == "fsdp":
+            from ..workers.fsdp_workers import FSDPWorker as ActorRolloutRefWorker
+        else:
+            raise NotImplementedError(f"Unknown actor strategy: {config.worker.actor.strategy}")
+
+        if config.worker.critic.strategy == "megatron":
+            from ..workers.megatron_workers import CriticWorker
+        elif config.worker.critic.strategy == "fsdp":
+            from ..workers.fsdp_workers import FSDPWorker as CriticWorker
+        else:
+            raise NotImplementedError(f"Unknown critic strategy: {config.worker.critic.strategy}")
+
         role_worker_mapping = {
-            Role.ActorRolloutRef: ray.remote(FSDPWorker),
-            Role.Critic: ray.remote(FSDPWorker),
+            Role.ActorRolloutRef: ray.remote(ActorRolloutRefWorker),
+            Role.Critic: ray.remote(CriticWorker),
         }
         global_pool_id = "global_pool"
         resource_pool_spec = {

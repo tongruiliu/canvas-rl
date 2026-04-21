@@ -88,6 +88,30 @@ class FSDPConfig:
 
 
 @dataclass
+class MegatronConfig:
+    tensor_model_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: Optional[int] = None
+    pipeline_model_parallel_size: int = 1
+    virtual_pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: int = 1
+    sequence_parallel: bool = True
+    use_distributed_optimizer: bool = True
+    use_dist_checkpointing: bool = False
+    dist_checkpointing_path: Optional[str] = None
+    dist_checkpointing_prefix: str = ""
+    param_offload: bool = False
+    grad_offload: bool = False
+    optimizer_offload: bool = False
+    dtype: str = "bfloat16"
+    seed: int = 42
+    use_mbridge: bool = True
+    vanilla_mbridge: bool = True
+    override_ddp_config: dict[str, Any] = field(default_factory=dict)
+    override_transformer_config: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OffloadConfig:
     offload_params: bool = False
     offload_optimizer: bool = False
@@ -131,7 +155,9 @@ class ActorConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
+    megatron: MegatronConfig = field(default_factory=MegatronConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
+    load_weight: bool = True
     # below are auto keys
     global_batch_size_per_device: int = field(default=-1, init=False)
     disable_kl: bool = field(default=False, init=False)
@@ -144,7 +170,9 @@ class ActorConfig:
 class RefConfig:
     strategy: str = "fsdp"
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
+    megatron: MegatronConfig = field(default_factory=MegatronConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
+    load_weight: bool = True
     # below are auto keys
     micro_batch_size_per_device_for_experience: int = field(default=-1, init=False)
     padding_free: bool = field(default=False, init=False)

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from enum import Enum, auto
-from functools import wraps
+from functools import partial, wraps
 from types import FunctionType
 from typing import TYPE_CHECKING, Literal, Union
 
@@ -38,6 +38,7 @@ class Dispatch(Enum):
     DP_COMPUTE_PROTO = auto()
     DP_COMPUTE_PROTO_WITH_FUNC = auto()
     DP_COMPUTE_METRIC = auto()
+    DIRECT_ROLLOUT_METHOD = auto()
 
 
 class Execute(Enum):
@@ -123,6 +124,71 @@ def collect_dp_compute_data_proto(worker_group: "WorkerGroup", outputs: list[Dat
     return _concat_data_proto_or_future(outputs)
 
 
+def dispatch_nd_compute(dp_rank_mapping: list[int], dp_size: int, worker_group: "WorkerGroup", *args, **kwargs):
+    """Dispatch one DP shard to each rank according to a model-parallel mesh mapping."""
+    all_args = []
+    for arg in args:
+        assert isinstance(arg, (tuple, list)) and len(arg) == dp_size
+        all_args.append([arg[dp_rank_mapping[i]] for i in range(worker_group.world_size)])
+
+    all_kwargs = {}
+    for key, value in kwargs.items():
+        assert isinstance(value, (tuple, list)) and len(value) == dp_size
+        all_kwargs[key] = [value[dp_rank_mapping[i]] for i in range(worker_group.world_size)]
+
+    return tuple(all_args), all_kwargs
+
+
+def collect_nd_compute(
+    collect_mask: list[bool], worker_group: "WorkerGroup", outputs: list[DataProto]
+) -> list[DataProto]:
+    assert len(outputs) == worker_group.world_size
+    return [output for output, should_collect in zip(outputs, collect_mask) if should_collect]
+
+
+def dispatch_nd_compute_data_proto(
+    dp_rank_mapping: list[int], dp_size: int, worker_group: "WorkerGroup", *args, **kwargs
+):
+    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(dp_size, *args, **kwargs)
+    return dispatch_nd_compute(dp_rank_mapping, dp_size, worker_group, *splitted_args, **splitted_kwargs)
+
+
+def collect_nd_compute_data_proto(collect_mask: list[bool], worker_group: "WorkerGroup", outputs: list[DataProto]):
+    outputs = collect_nd_compute(collect_mask, worker_group, outputs)
+    return _concat_data_proto_or_future(outputs)
+
+
+def dispatch_lazy_compute_data_proto(mesh_name: str, worker_group: "WorkerGroup", *args, **kwargs):
+    if mesh_name not in worker_group._dispatch_info:
+        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+        assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
+
+    dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+    dp_size = max(dp_rank_mapping) + 1
+    return dispatch_nd_compute_data_proto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+
+
+def collect_lazy_compute_data_proto(mesh_name: str, worker_group: "WorkerGroup", outputs: list[DataProto]):
+    if mesh_name not in worker_group._collect_info:
+        worker_group._collect_info[mesh_name] = worker_group._query_collect_info(mesh_name)
+        assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
+
+    collect_mask = worker_group._collect_info[mesh_name]
+    return collect_nd_compute_data_proto(collect_mask, worker_group, outputs)
+
+
+def make_nd_compute_dataproto_dispatch_fn(mesh_name: str):
+    """Create a dispatch mode for Megatron-style TP/PP/EP workers grouped by data-parallel rank."""
+    return {
+        "dispatch_fn": partial(dispatch_lazy_compute_data_proto, mesh_name),
+        "collect_fn": partial(collect_lazy_compute_data_proto, mesh_name),
+    }
+
+
+def dummy_direct_rollout_call(worker_group: "WorkerGroup", *args, **kwargs):
+    raise NotImplementedError("Direct rollout calls are not enabled in canvas-rl's synchronous vLLM path.")
+
+
 def get_predefined_dispatch_fn(dispatch_mode: Dispatch):
     predefined_dispatch_mode_fn = {
         Dispatch.ONE_TO_ALL: {
@@ -148,6 +214,10 @@ def get_predefined_dispatch_fn(dispatch_mode: Dispatch):
         Dispatch.DP_COMPUTE_METRIC: {
             "dispatch_fn": dispatch_dp_compute_data_proto,
             "collect_fn": collect_dp_compute,
+        },
+        Dispatch.DIRECT_ROLLOUT_METHOD: {
+            "dispatch_fn": dummy_direct_rollout_call,
+            "collect_fn": dummy_direct_rollout_call,
         },
     }
     return predefined_dispatch_mode_fn[dispatch_mode]

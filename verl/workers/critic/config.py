@@ -17,7 +17,7 @@ Critic config
 
 from dataclasses import dataclass, field
 
-from ..actor.config import FSDPConfig, ModelConfig, OffloadConfig, OptimConfig
+from ..actor.config import FSDPConfig, MegatronConfig, ModelConfig, OffloadConfig, OptimConfig
 
 
 @dataclass
@@ -46,6 +46,8 @@ class CriticConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
+    megatron: MegatronConfig = field(default_factory=MegatronConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
+    load_weight: bool = True
     # below are auto keys
     global_batch_size_per_device: int = field(default=-1, init=False)
